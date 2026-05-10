@@ -1,18 +1,20 @@
-name: Build JioHotstar Premium
+name: JioHotstar AutoBuild
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Specific version (leave empty for latest)'
+        required: false
+        type: string
+        default: ''
+  schedule:
+    - cron: '0 6 * * *'
   push:
-    branches: [main]
     paths:
       - 'cookies/**'
       - 'patches/**'
       - 'scripts/**'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'APK version override (leave empty for latest)'
-        required: false
-        type: string
 
 env:
   PACKAGE_NAME: in.startv.hotstar
@@ -25,7 +27,6 @@ jobs:
       contents: write
       actions: write
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,97 +44,478 @@ jobs:
         run: |
           APKTOOL_URL=$(curl -sL "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest" | \
             python3 -c "import sys,json; print(json.load(sys.stdin)['assets'][0]['browser_download_url'])")
+          echo "Downloading apktool from: $APKTOOL_URL"
           curl -sL "$APKTOOL_URL" -o /usr/local/bin/apktool.jar
           echo '#!/bin/bash' > /usr/local/bin/apktool
           echo 'exec java -jar /usr/local/bin/apktool.jar "$@"' >> /usr/local/bin/apktool
           chmod +x /usr/local/bin/apktool
           apktool --version
 
-      - name: Validate cookies
+      - name: Validate cookie files
         run: |
+          echo "=== Cookie files ==="
           REQUIRED=(sessionUserUP.txt userHID.txt userPID.txt deviceId.txt)
           MISSING=()
+          EMPTY=()
           for f in "${REQUIRED[@]}"; do
-            if [ ! -f "cookies/$f" ]; then MISSING+=("$f")
-            elif [ ! -s "cookies/$f" ]; then echo "::warning::Empty: $f"; fi
+            if [ ! -f "cookies/$f" ]; then
+              MISSING+=("$f")
+            elif [ ! -s "cookies/$f" ]; then
+              EMPTY+=("$f")
+            else
+              echo "  $f: $(wc -c < cookies/$f) bytes"
+            fi
           done
-          [ ${#MISSING[@]} -gt 0 ] && { echo "::error::Missing: ${MISSING[*]}"; exit 1; }
-          echo "All cookies validated"
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::Missing cookie files: ${MISSING[*]}"
+            exit 1
+          fi
+          if [ ${#EMPTY[@]} -gt 0 ]; then
+            echo "::warning::Empty cookie files: ${EMPTY[*]}"
+          fi
+          if [ -f cookies/media_token.txt ]; then
+            echo "  media_token.txt: $(wc -c < cookies/media_token.txt) bytes"
+          fi
+          echo "All cookies validated."
 
       - name: Download APK from DietDroid
         id: download
         run: |
           PKG="${{ env.PACKAGE_NAME }}"
           ARCH="${{ env.ARCH }}"
-          echo "Downloading ${PKG} (${ARCH})..."
+          VERSION="${{ inputs.version }}"
 
-          # Try merged endpoint
-          curl -sS -L --max-time 300 \
+          echo "Downloading ${PKG} (${ARCH}) from DietDroid..."
+
+          echo "Trying merged endpoint..."
+          MERGED_RESP=$(curl -sS -f --max-time 180 \
             "https://apkdl.dietdroid.com/api/download-merged/${PKG}?arch=${ARCH}" \
-            -o base.apk -w "%{http_code}" > /tmp/http_code 2>/dev/null
+            -o jiohotstar.apk -w "%{http_code}" 2>/dev/null) || MERGED_RESP="000"
 
-          SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
-          if [ "$SIZE" -lt 5000000 ]; then
-            echo "Merged failed, trying base endpoint..."
+          if [ "$MERGED_RESP" = "200" ] && [ -f jiohotstar.apk ] && [ "$(stat -c%s jiohotstar.apk)" -gt 5000000 ]; then
+            echo "Merged download succeeded: $(du -h jiohotstar.apk | cut -f1)"
+          else
+            echo "Merged endpoint failed (HTTP $MERGED_RESP), trying base APK fallback..."
+            rm -f jiohotstar.apk
             curl -sS -L --max-time 180 \
               "https://apkdl.dietdroid.com/download/${PKG}?arch=${ARCH}" \
-              -o base.apk 2>/dev/null || true
-            SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
-          fi
+              -o jiohotstar.apk 2>/dev/null || true
 
-          if [ "$SIZE" -lt 5000000 ]; then
-            echo "Base failed, trying splits..."
-            for i in 0 1 2 3 4; do
-              curl -sS -L --max-time 60 \
-                "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
-                -o "split_${i}.apk" 2>/dev/null || true
-              if [ -f "split_${i}.apk" ]; then
-                SSIZE=$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)
-                if [ "$SSIZE" -gt 5000000 ]; then
-                  SO=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-                  if [ "$SO" -gt 0 ]; then
-                    echo "Split $i: $SO libs, using as base"
-                    cp "split_${i}.apk" base.apk
+            if [ ! -f jiohotstar.apk ] || [ "$(stat -c%s jiohotstar.apk 2>/dev/null || echo 0)" -lt 5000000 ]; then
+              echo "Base APK too small, trying individual splits..."
+              rm -f jiohotstar.apk
+              for i in 0 1 2 3 4; do
+                echo "  Trying split $i..."
+                curl -sS -L --max-time 60 \
+                  "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
+                  -o "split_${i}.apk" 2>/dev/null || true
+                if [ -f "split_${i}.apk" ] && [ "$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+                  SO_COUNT=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+                  if [ "$SO_COUNT" -gt 0 ]; then
+                    echo "  Split $i has $SO_COUNT arm64 libs, using as source"
+                    cp "split_${i}.apk" jiohotstar.apk
                     break
                   fi
                 fi
-              fi
-              rm -f "split_${i}.apk"
-            done
-            SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
+                rm -f "split_${i}.apk"
+              done
+            fi
           fi
 
-          [ "$SIZE" -lt 1000000 ] && { echo "::error::Download failed"; exit 1; }
-          echo "Downloaded: $(du -h base.apk | cut -f1)"
+          if [ ! -f jiohotstar.apk ]; then
+            echo "::error::Failed to download APK from DietDroid"
+            exit 1
+          fi
 
-      - name: Patch APK
-        run: bash scripts/patch.sh base.apk
+          SIZE=$(stat -c%s jiohotstar.apk)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::Downloaded file too small ($SIZE bytes)"
+            file jiohotstar.apk
+            exit 1
+          fi
+
+          echo "Downloaded: $(du -h jiohotstar.apk | cut -f1)"
+          echo "downloaded_size=$(du -h jiohotstar.apk | cut -f1)" >> $GITHUB_OUTPUT
+
+      - name: Decompile APK
+        id: decompile
+        run: |
+          echo "Decompiling with apktool..."
+          apktool d jiohotstar.apk -o decompiled -f 2>&1 | tail -5
+          echo "Decompiled OK"
+
+          VCODE=$(grep -oP '^\s*versionCode:\s*\K[0-9]+' decompiled/apktool.yml 2>/dev/null | head -1) || true
+          VNAME=$(grep -oP "^\s*versionName:\s*\K[^'\"\n]+" decompiled/apktool.yml 2>/dev/null | tr -d "'\"" | head -1) || true
+          echo "version_code=${VCODE:-unknown}" >> $GITHUB_OUTPUT
+          echo "version_name=${VNAME:-unknown}" >> $GITHUB_OUTPUT
+          echo "Extracted version: code=${VCODE:-?} name=${VNAME:-?}"
+
+      - name: Remove split APK flags & fix resources
+        run: |
+          MANIFEST="decompiled/AndroidManifest.xml"
+
+          if grep -q 'android:isSplitRequired' "$MANIFEST"; then
+            sed -i 's/ android:isSplitRequired="[^"]*"//g' "$MANIFEST"
+            echo "Fixed: removed isSplitRequired"
+          fi
+          if grep -q 'android:requiredSplitTypes' "$MANIFEST"; then
+            sed -i 's/ android:requiredSplitTypes="[^"]*"//g' "$MANIFEST"
+            echo "Fixed: removed requiredSplitTypes"
+          fi
+          if grep -q 'android:splitTypes' "$MANIFEST"; then
+            sed -i 's/ android:splitTypes="[^"]*"//g' "$MANIFEST"
+            echo "Fixed: removed splitTypes"
+          fi
+          if grep -q 'com.android.vending.splits.required' "$MANIFEST"; then
+            sed -i '/com.android.vending.splits.required/d' "$MANIFEST"
+            echo "Fixed: removed splits.required meta-data"
+          fi
+          if grep -q 'android:name="com.android.vending.splits"' "$MANIFEST"; then
+            sed -i '/android:name="com.android.vending.splits"/d' "$MANIFEST"
+            echo "Fixed: removed splits meta-data"
+          fi
+
+          if grep -q 'android:extractNativeLibs="false"' "$MANIFEST"; then
+            sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/g' "$MANIFEST"
+            echo "Fixed: extractNativeLibs=true"
+          fi
+
+          if grep -q 'android:intentMatchingFlags' "$MANIFEST"; then
+            sed -i 's/android:intentMatchingFlags="[^"]*" //g' "$MANIFEST"
+            echo "Fixed: removed intentMatchingFlags"
+          fi
+
+          NULL_COUNT=$(grep -rl 'android:drawable="@null"' decompiled/res/drawable* 2>/dev/null | wc -l)
+          if [ "$NULL_COUNT" -gt 0 ]; then
+            find decompiled/res/drawable* -name "*.xml" -exec \
+              sed -i 's/android:drawable="@null"/android:drawable="@android:color\/transparent"/g' {} \; 2>/dev/null
+            echo "Fixed $NULL_COUNT drawable files: @null -> @android:color/transparent"
+          fi
+
+      - name: Inject smali patches
+        run: |
+          SMALI_DIR=""
+          SMALLEST=999999
+          for dir in decompiled/smali*/; do
+            COUNT=$(find "$dir" -name "*.smali" -type f 2>/dev/null | wc -l)
+            if [ "$COUNT" -lt "$SMALLEST" ]; then
+              SMALLEST=$COUNT
+              SMALI_DIR="$dir"
+            fi
+          done
+          [ -z "$SMALI_DIR" ] && SMALI_DIR="decompiled/smali/"
+          echo "Using smali dir: $SMALI_DIR ($SMALLEST files)"
+
+          TARGET="$SMALI_DIR/com/hotstar/patch"
+          mkdir -p "$TARGET"
+          cp patches/CookieFileReader.smali "$TARGET/CookieFileReader.smali"
+          cp patches/cookie-seeder.smali "$TARGET/CookieSeeder.smali"
+          echo "Smali patches injected"
+
+          mkdir -p decompiled/assets/cookies
+          for f in cookies/*.txt; do
+            [ -f "$f" ] && cp "$f" "decompiled/assets/cookies/$(basename "$f")"
+            echo "  $(basename "$f") -> assets/cookies/"
+          done
+          echo "Cookie assets injected"
+
+      - name: Patch Application class (CookieSeeder hook)
+        run: |
+          MANIFEST="decompiled/AndroidManifest.xml"
+          APP_CLASS=$(grep -oP '<application[^>]*android:name="\K[^"]+' "$MANIFEST")
+          echo "Application class: $APP_CLASS"
+
+          SMALI_PATH="${APP_CLASS//./\/}.smali"
+          FULL_PATH=""
+          for dir in decompiled/smali*/; do
+            if [ -f "${dir}${SMALI_PATH}" ]; then
+              FULL_PATH="${dir}${SMALI_PATH}"
+              break
+            fi
+          done
+
+          if [ -z "$FULL_PATH" ]; then
+            CLASS_NAME=$(echo "$APP_CLASS" | sed 's/.*\.//')
+            FULL_PATH=$(find decompiled -path "*/smali*" -name "${CLASS_NAME}.smali" -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$FULL_PATH" ]; then
+            echo "::error::Application class not found: $APP_CLASS"
+            exit 1
+          fi
+          echo "Found: $FULL_PATH"
+
+          if grep -q "CookieSeeder" "$FULL_PATH"; then
+            echo "Already patched, skipping"
+            exit 0
+          fi
+
+          INJECT='    invoke-static {p0}, Lcom/hotstar/patch/CookieSeeder;->seedIfNeeded(Landroid/content/Context;)V'
+
+          if grep -q "invoke-super.*attachBaseContext" "$FULL_PATH"; then
+            sed -i "/invoke-super.*attachBaseContext/a\\${INJECT}" "$FULL_PATH"
+            echo "Patched: after attachBaseContext super call"
+          elif grep -q "invoke-super.*onCreate" "$FULL_PATH"; then
+            sed -i "/invoke-super.*onCreate/a\\${INJECT}" "$FULL_PATH"
+            echo "Patched: after onCreate super call"
+          else
+            sed -i '0,/invoke-super/{s/invoke-super.*/&\n'"${INJECT}"'/}' "$FULL_PATH"
+            echo "Patched: after first super call"
+          fi
+
+          grep -q "CookieSeeder" "$FULL_PATH" && echo "Verification: PASSED" || { echo "::error::Verification FAILED"; exit 1; }
+
+      - name: Patch IdentityRepository (LDf/d)
+        run: |
+          ID_REPO=""
+          for dir in decompiled/smali*/; do
+            if [ -f "${dir}Df/d.smali" ]; then
+              ID_REPO="${dir}Df/d.smali"
+              break
+            fi
+          done
+
+          if [ -z "$ID_REPO" ]; then
+            echo "::error::IdentityRepository (Df/d.smali) not found"
+            exit 1
+          fi
+          echo "Found: $ID_REPO"
+
+          if grep -q "CookieSeeder.*getInjectedUserToken" "$ID_REPO"; then
+            echo "Already patched, skipping"
+            exit 0
+          fi
+
+          awk '
+          BEGIN { in_i = 0; in_d = 0; in_ann = 0; first_inst = 0; }
+
+          /\.method public final i\(Lot\/d;\)Ljava\/lang\/Object;/ {
+            in_i = 1; in_d = 0; in_ann = 0; first_inst = 0
+            print; next
+          }
+          in_i == 1 {
+            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+            if (/\.annotation build/) { in_ann = 1 }
+            if (/\.end annotation/) { in_ann = 0 }
+            if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
+            if (/iget-object v0, p0, LDf\/d;->a:Ljava\/lang\/String;/ && first_inst == 0) {
+              first_inst = 1
+              print ""
+              print "    # PATCH: inject user token when field a is null"
+              print "    iget-object v0, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    if-nez v0, :patch_orig_i"
+              print ""
+              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
+              print "    move-result-object v1"
+              print "    if-eqz v1, :patch_orig_i"
+              print ""
+              print "    iput-object v1, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    return-object v1"
+              print ""
+              print "    :patch_orig_i"
+              print ""
+            }
+            if (/^\.end method/) { in_i = 0 }
+            print; next
+          }
+
+          /\.method public final d\(Lwe\/J;\)Ljava\/lang\/Object;/ {
+            in_d = 1; in_i = 0; in_ann = 0; first_inst = 0
+            print; next
+          }
+          in_d == 1 {
+            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+            if (/\.annotation build/) { in_ann = 1 }
+            if (/\.end annotation/) { in_ann = 0 }
+            if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
+            if (/iget-object v0, p0, LDf\/d;->g:Ljava\/lang\/String;/ && first_inst == 0) {
+              first_inst = 1
+              print ""
+              print "    # PATCH: inject media token when field g is null"
+              print "    iget-object v0, p0, LDf/d;->g:Ljava/lang/String;"
+              print "    if-nez v0, :patch_orig_d"
+              print ""
+              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
+              print "    move-result-object v1"
+              print "    if-eqz v1, :patch_orig_d"
+              print ""
+              print "    iput-object v1, p0, LDf/d;->g:Ljava/lang/String;"
+              print "    return-object v1"
+              print ""
+              print "    :patch_orig_d"
+              print ""
+            }
+            if (/^\.end method/) { in_d = 0 }
+            print; next
+          }
+
+          { print }
+          ' "$ID_REPO" > patched_d.smali
+
+          [ ! -s patched_d.smali ] && { echo "::error::Patching produced empty file"; exit 1; }
+          mv patched_d.smali "$ID_REPO"
+
+          grep -q "CookieSeeder.*getInjectedUserToken" "$ID_REPO" && echo "getUserToken patch: OK" || { echo "::error::getUserToken patch FAILED"; exit 1; }
+          grep -q "CookieSeeder.*getInjectedMediaToken" "$ID_REPO" && echo "getMediaToken patch: OK" || { echo "::error::getMediaToken patch FAILED"; exit 1; }
+
+      - name: Recompile APK
+        run: |
+          echo "Recompiling..."
+          apktool b decompiled -o jiohotstar_unsigned.apk 2>&1 | tail -10
+          [ ! -f jiohotstar_unsigned.apk ] && { echo "::error::Recompile failed"; exit 1; }
+          echo "Recompiled: $(du -h jiohotstar_unsigned.apk | cut -f1)"
+
+      - name: Check native libs
+        id: native_check
+        run: |
+          LIB_COUNT=$(unzip -l jiohotstar_unsigned.apk 2>/dev/null | grep -c "lib/.*\.so" || true)
+          echo "Native libs in rebuilt APK: $LIB_COUNT"
+          echo "lib_count=$LIB_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Inject native libs (if missing)
+        if: steps.native_check.outputs.lib_count == '0'
+        run: |
+          echo "No native libs found, downloading arm64 split..."
+          PKG="${{ env.PACKAGE_NAME }}"
+          ARCH="${{ env.ARCH }}"
+
+          for i in 0 1 2 3 4; do
+            echo "Trying split $i..."
+            curl -sS -L --max-time 60 \
+              "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
+              -o "split_${i}.apk" 2>/dev/null || true
+
+            if [ -f "split_${i}.apk" ] && [ "$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+              SO_COUNT=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+              if [ "$SO_COUNT" -gt 0 ]; then
+                echo "Split $i has $SO_COUNT arm64 libs"
+                mkdir -p lib_tmp
+                unzip -o "split_${i}.apk" "lib/*" -d lib_tmp 2>/dev/null || true
+                break
+              fi
+            fi
+            rm -f "split_${i}.apk"
+          done
+
+          [ ! -d lib_tmp ] && { echo "::warning::No arm64 source for lib injection"; exit 0; }
+
+          cp jiohotstar_unsigned.apk jiohotstar_mod.apk
+          zip -d jiohotstar_mod.apk "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.MF" 2>/dev/null || true
+          (cd lib_tmp && zip -r ../jiohotstar_mod.apk lib/ 2>/dev/null)
+          rm -rf lib_tmp
+
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+          export PATH="${BUILD_TOOLS}:${PATH}"
+
+          zipalign -f 4 jiohotstar_mod.apk jiohotstar_aligned.apk
+          keytool -genkeypair -v -keystore sign.keystore -alias hotstar -keyalg RSA \
+            -keysize 2048 -validity 10000 -storepass hotstarpatch -keypass hotstarpatch \
+            -dname "CN=Patcher, OU=Patch, O=HP, L=X, ST=X, C=XX" 2>/dev/null
+          apksigner sign --ks sign.keystore --ks-pass pass:hotstarpatch \
+            --ks-key-alias hotstar --key-pass pass:hotstarpatch \
+            --out jiohotstar_patched.apk jiohotstar_aligned.apk 2>/dev/null
+
+          echo "Native lib injection complete"
+          rm -f jiohotstar_mod.apk jiohotstar_aligned.apk
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Sign APK (when libs already present)
+        if: steps.native_check.outputs.lib_count != '0'
+        run: |
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+          export PATH="${BUILD_TOOLS}:${PATH}"
+
+          keytool -genkeypair -v -keystore sign.keystore -alias hotstar -keyalg RSA \
+            -keysize 2048 -validity 10000 -storepass hotstarpatch -keypass hotstarpatch \
+            -dname "CN=Patcher, OU=Patch, O=HP, L=X, ST=X, C=XX" 2>/dev/null
+
+          zipalign -f 4 jiohotstar_unsigned.apk jiohotstar_aligned.apk
+          apksigner sign --ks sign.keystore --ks-pass pass:hotstarpatch \
+            --ks-key-alias hotstar --key-pass pass:hotstarpatch \
+            --out jiohotstar_patched.apk jiohotstar_aligned.apk 2>/dev/null
+
+          apksigner verify jiohotstar_patched.apk 2>/dev/null && echo "Signature: OK" || echo "Signature: verify failed (may still work)"
+          rm -f jiohotstar_aligned.apk
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Final APK info
+        id: final
+        run: |
+          [ ! -f jiohotstar_patched.apk ] && { echo "::error::Final APK missing"; exit 1; }
+          SIZE=$(du -h jiohotstar_patched.apk | cut -f1)
+          echo "Final APK: $SIZE"
+          echo "apk_size=$SIZE" >> $GITHUB_OUTPUT
+          LIBS=$(unzip -l jiohotstar_patched.apk 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+          echo "arm64 native libs: $LIBS"
+
+      - name: Rename APK
+        run: |
+          VERSION="${{ steps.decompile.outputs.version_code }}"
+          VNAME="${{ steps.decompile.outputs.version_name }}"
+          DATE=$(date +'%Y%m%d')
+          if [ "$VERSION" != "unknown" ] && [ "$VNAME" != "unknown" ]; then
+            FINAL_NAME="JioHotstar-Premium-v${VNAME}-${DATE}-arm64.apk"
+          elif [ "$VERSION" != "unknown" ]; then
+            FINAL_NAME="JioHotstar-Premium-v${VERSION}-${DATE}-arm64.apk"
+          else
+            FINAL_NAME="JioHotstar-Premium-${DATE}-arm64.apk"
+          fi
+          cp jiohotstar_patched.apk "$FINAL_NAME"
+          echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
+          echo "APK name: $FINAL_NAME"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jiohotstar-premium
-          path: scripts/build/jiohotstar_patched.apk
+          name: jiohotstar-patched-apk
+          path: JioHotstar-Premium-*.apk
           retention-days: 7
 
-      - name: Create Release
+      - name: Delete old release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "JioHotstar Premium (Auto-Build)"
+          name: "JioHotstar Premium ${{ steps.decompile.outputs.version_name != 'unknown' && format('v{0}', steps.decompile.outputs.version_name) || 'Latest Build' }}"
           body: |
-            Auto-built patched JioHotstar with premium cookie injection.
+            Automated build from GitHub Actions
+
+            **Version Code**: `${{ steps.decompile.outputs.version_code }}`
+            **Version Name**: `${{ steps.decompile.outputs.version_name }}`
+            **Size**: `${{ steps.final.outputs.apk_size }}`
+            **Architecture**: arm64-v8a
 
             ### Features
-            - Premium auto-login (no manual login needed)
+            - Premium account auto-login via cookie injection
             - No root required
-            - Ad-free with premium cookies
+            - Ad-free experience (with premium cookies)
+            - All content unlocked
 
-            ### Install
+            ### How to use
             1. Uninstall any existing JioHotstar
-            2. Download and install
-            3. Launch - auto premium login
-          files: scripts/build/jiohotstar_patched.apk
+            2. Download and install this APK
+            3. Launch - you will be logged in automatically
+
+            > Cookies auto-refresh after first login. Rebuild when cookies expire.
+
+            ---
+            *Built by [JioHotstar AutoBuild](https://github.com/${{ github.repository }})*
+          files: JioHotstar-Premium-*.apk
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup workflow runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 3
+          keep_minimum_runs: 5
