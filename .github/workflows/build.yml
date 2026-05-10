@@ -1,0 +1,139 @@
+name: Build JioHotstar Premium
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cookies/**'
+      - 'patches/**'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'APK version override (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  PACKAGE_NAME: in.startv.hotstar
+  ARCH: arm64-v8a
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install apktool
+        run: |
+          APKTOOL_URL=$(curl -sL "https://api.github.com/repos/iBotPeaches/Apktool/releases/latest" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['assets'][0]['browser_download_url'])")
+          curl -sL "$APKTOOL_URL" -o /usr/local/bin/apktool.jar
+          echo '#!/bin/bash' > /usr/local/bin/apktool
+          echo 'exec java -jar /usr/local/bin/apktool.jar "$@"' >> /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Validate cookies
+        run: |
+          REQUIRED=(sessionUserUP.txt userHID.txt userPID.txt deviceId.txt)
+          MISSING=()
+          for f in "${REQUIRED[@]}"; do
+            if [ ! -f "cookies/$f" ]; then MISSING+=("$f")
+            elif [ ! -s "cookies/$f" ]; then echo "::warning::Empty: $f"; fi
+          done
+          [ ${#MISSING[@]} -gt 0 ] && { echo "::error::Missing: ${MISSING[*]}"; exit 1; }
+          echo "All cookies validated"
+
+      - name: Download APK from DietDroid
+        id: download
+        run: |
+          PKG="${{ env.PACKAGE_NAME }}"
+          ARCH="${{ env.ARCH }}"
+          echo "Downloading ${PKG} (${ARCH})..."
+
+          # Try merged endpoint
+          curl -sS -L --max-time 300 \
+            "https://apkdl.dietdroid.com/api/download-merged/${PKG}?arch=${ARCH}" \
+            -o base.apk -w "%{http_code}" > /tmp/http_code 2>/dev/null
+
+          SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "Merged failed, trying base endpoint..."
+            curl -sS -L --max-time 180 \
+              "https://apkdl.dietdroid.com/download/${PKG}?arch=${ARCH}" \
+              -o base.apk 2>/dev/null || true
+            SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
+          fi
+
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "Base failed, trying splits..."
+            for i in 0 1 2 3 4; do
+              curl -sS -L --max-time 60 \
+                "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
+                -o "split_${i}.apk" 2>/dev/null || true
+              if [ -f "split_${i}.apk" ]; then
+                SSIZE=$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)
+                if [ "$SSIZE" -gt 5000000 ]; then
+                  SO=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+                  if [ "$SO" -gt 0 ]; then
+                    echo "Split $i: $SO libs, using as base"
+                    cp "split_${i}.apk" base.apk
+                    break
+                  fi
+                fi
+              fi
+              rm -f "split_${i}.apk"
+            done
+            SIZE=$(stat -c%s base.apk 2>/dev/null || echo 0)
+          fi
+
+          [ "$SIZE" -lt 1000000 ] && { echo "::error::Download failed"; exit 1; }
+          echo "Downloaded: $(du -h base.apk | cut -f1)"
+
+      - name: Patch APK
+        run: bash scripts/patch.sh base.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiohotstar-premium
+          path: scripts/build/jiohotstar_patched.apk
+          retention-days: 7
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "JioHotstar Premium (Auto-Build)"
+          body: |
+            Auto-built patched JioHotstar with premium cookie injection.
+
+            ### Features
+            - Premium auto-login (no manual login needed)
+            - No root required
+            - Ad-free with premium cookies
+
+            ### Install
+            1. Uninstall any existing JioHotstar
+            2. Download and install
+            3. Launch - auto premium login
+          files: scripts/build/jiohotstar_patched.apk
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
