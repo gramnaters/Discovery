@@ -5,7 +5,6 @@
   <img src="https://img.shields.io/badge/Arch-arm64--v8a-green" alt="Architecture">
   <img src="https://img.shields.io/badge/Root-Not_Required-success" alt="Root">
   <img src="https://img.shields.io/badge/AutoBuild-GitHub_Actions-orange" alt="CI/CD">
-  <img src="https://img.shields.io/badge/Source-DietDroid-purple" alt="APK Source">
 </p>
 
 [![View Latest Release](https://img.shields.io/badge/View%20Latest%20Release-0A0A0A?style=flat&logo=github&logoColor=white)](https://github.com/gramnaters/Discovery/releases/latest)
