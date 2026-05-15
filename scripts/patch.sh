@@ -1,10 +1,12 @@
 #!/bin/bash
 # ============================================================
-#  JioHotstar Premium Patcher v3.0
-#  Downloads APK from DietDroid → injects cookies → signed APK
+#  JioHotstar Premium Patcher v3.1
+#  Downloads APK from gplay-apk-downloader -> injects cookies -> signed APK
 #
 #  Usage: bash scripts/patch.sh [path/to/base.apk]
-#  If no APK provided, downloads automatically from DietDroid
+#  If no APK provided, downloads automatically via gplay-apk-downloader
+#
+#  Requires: python3, curl, java, apktool, apksigner, zipalign
 # ============================================================
 
 set -uo pipefail
@@ -25,6 +27,10 @@ KEYSTORE_PASS="hotstarpatch"
 KEY_ALIAS="hotstar"
 BASE_APK="${1:-}"
 PKG_NAME="in.startv.hotstar"
+ARCH="arm64-v8a"
+
+# gplay-apk-downloader API (self-hosted replacement for DietDroid)
+APK_DL_API="${APK_DL_API:-https://gplay-apk-downloader-zyuj.onrender.com}"
 
 # Colors
 if [ -t 1 ]; then
@@ -34,14 +40,14 @@ else
 fi
 log_i()  { echo -e "${B}[INFO]${N} $*"; }
 log_ok() { echo -e "${G}[OK]${N} $*"; }
-log_w()  { echo -e "${Y}[WARN]${N} $*"; }
+log_w()  { echo -e "${Y}[WARN]${N} $*" >&2; }
 log_e()  { echo -e "${R}[ERROR]${N} $*" >&2; }
 
 banner() {
     echo ""
     echo -e "${G}========================================${N}"
-    echo -e "${G}  JioHotstar Premium Patcher v3.0       ${N}"
-    echo -e "${G}  DietDroid + CookieSeeder Pipeline     ${N}"
+    echo -e "${G}  JioHotstar Premium Patcher v3.1       ${N}"
+    echo -e "${G}  gplay-apk-downloader + CookieSeeder   ${N}"
     echo -e "${G}========================================${N}"
     echo ""
 }
@@ -49,7 +55,7 @@ banner() {
 check_deps() {
     log_i "Checking dependencies..."
     local missing=()
-    for cmd in java apktool apksigner zipalign; do
+    for cmd in java apktool apksigner zipalign curl python3; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ ${#missing[@]} -ne 0 ]; then
@@ -81,90 +87,146 @@ validate_cookies() {
 }
 
 download_apk() {
-    log_i "Downloading APK from DietDroid..."
     local output="$1"
-    local arch="arm64-v8a"
-    local ua="Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+    log_i "Downloading APK from gplay-apk-downloader..."
+    log_i "  API: ${APK_DL_API}"
 
-    # Method 1: Merged download
-    log_i "  Trying merged endpoint..."
-    if curl -sS -L --max-time 300 -o "$output" \
-        "https://apkdl.dietdroid.com/api/download-merged/${PKG_NAME}?arch=${arch}" 2>/dev/null; then
-        local size
-        size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-        if [ "$size" -gt 5000000 ]; then
-            log_ok "  Merged download: $(du -h "$output" | cut -f1)"
-            return 0
-        fi
+    python3 << PYEOF
+import json, subprocess, sys, time, os
+
+API = os.environ.get('APK_DL_API', '${APK_DL_API}')
+PKG = '${PKG_NAME}'
+ARCH = '${ARCH}'
+OUTPUT = '${output}'
+
+def parse_sse(endpoint, max_wait=180):
+    """Call an SSE endpoint and return the first success event."""
+    proc = subprocess.Popen(
+        ['curl', '-sN', '--max-time', str(max_wait), endpoint],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    success_data = None
+    start = time.time()
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('data: '):
+            try:
+                data = json.loads(line[6:])
+                if data.get('type') == 'progress':
+                    msg = data.get('message', '')
+                    step = data.get('step', '')
+                    print(f"    [{step}] {msg}", flush=True)
+                elif data.get('type') == 'success':
+                    success_data = data
+                    break
+            except json.JSONDecodeError:
+                pass
+        if time.time() - start > max_wait:
+            print("    [TIMEOUT] Max wait exceeded", flush=True)
+            break
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return success_data
+
+def download_file(url, out_path, cookie_str="", max_time=300):
+    """Download a file with optional cookie header."""
+    cmd = ['curl', '-sS', '-L', '--max-time', str(max_time), '-o', out_path]
+    if cookie_str:
+        cmd += ['-H', f'Cookie: {cookie_str}']
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
+# Method 1: Merged download (server-side merge+sign)
+print("\n  Method 1: Merged download via SSE stream...", flush=True)
+merged = parse_sse(f"{API}/api/download-merged-stream/{PKG}?arch={ARCH}", max_wait=300)
+
+if merged and merged.get('download_id'):
+    dl_id = merged['download_id']
+    print(f"    Got download_id: {dl_id}", flush=True)
+    print(f"    Downloading merged APK...", flush=True)
+    if download_file(f"{API}/api/download-temp/{dl_id}", OUTPUT):
+        size = os.path.getsize(OUTPUT)
+        if size > 5000000:
+            print(f"    SUCCESS: {size / 1024 / 1024:.1f} MB", flush=True)
+            sys.exit(0)
+        else:
+            print(f"    Merged APK too small ({size} bytes)", flush=True)
+    else:
+        print(f"    Failed to download from temp endpoint", flush=True)
+else:
+    print(f"    Merged endpoint did not return download_id", flush=True)
+
+if os.path.exists(OUTPUT):
+    os.remove(OUTPUT)
+
+# Method 2: Direct CDN download via info stream
+print("\n  Method 2: Direct CDN download via info stream...", flush=True)
+info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=120)
+
+if not info:
+    print("ERROR: Failed to get download info from API", flush=True)
+    sys.exit(1)
+
+dl_url = info.get('downloadUrl')
+cookies_list = info.get('cookies', [])
+cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies_list]) if cookies_list else ''
+splits = info.get('splits', [])
+
+print(f"    App: {info.get('title', PKG)}", flush=True)
+print(f"    Version: {info.get('version')} (code: {info.get('versionCode')})", flush=True)
+print(f"    Base: {info.get('filename')} ({info.get('size')})", flush=True)
+print(f"    Splits: {len(splits)}", flush=True)
+
+if not dl_url:
+    print("ERROR: No download URL in info response", flush=True)
+    sys.exit(1)
+
+print(f"\n    Downloading base APK from Google CDN...", flush=True)
+if not download_file(dl_url, OUTPUT, cookie_str, 300):
+    print("ERROR: Base APK download failed", flush=True)
+    sys.exit(1)
+
+size = os.path.getsize(OUTPUT)
+if size < 1000000:
+    print(f"ERROR: Base APK too small ({size} bytes)", flush=True)
+    sys.exit(1)
+
+print(f"    SUCCESS: Base APK {size / 1024 / 1024:.1f} MB", flush=True)
+
+# Pre-download arm64 split for later native lib injection
+for split in splits:
+    if 'arm64' in split.get('name', '').lower():
+        split_url = split.get('downloadUrl')
+        if split_url:
+            arm64_path = os.path.join(os.path.dirname(OUTPUT), 'arm64_split.apk')
+            print(f"\n    Pre-downloading arm64 split ({split.get('name')})...", flush=True)
+            if download_file(split_url, arm64_path, cookie_str, 300):
+                print(f"    Arm64 split saved: {os.path.getsize(arm64_path) / 1024 / 1024:.1f} MB", flush=True)
+            else:
+                print(f"    WARNING: Arm64 split download failed", flush=True)
+        break
+
+PYEOF
+    local result=$?
+    if [ $result -ne 0 ]; then
+        log_e "APK download failed (exit code: $result)"
+        exit 1
     fi
-    rm -f "$output"
-
-    # Method 2: Base APK
-    log_i "  Trying base endpoint..."
-    if curl -sS -L --max-time 180 -H "User-Agent: $ua" -o "$output" \
-        "https://apkdl.dietdroid.com/download/${PKG_NAME}?arch=${arch}" 2>/dev/null; then
-        local size
-        size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-        if [ "$size" -gt 5000000 ]; then
-            log_ok "  Base download: $(du -h "$output" | cut -f1)"
-            return 0
-        fi
+    if [ ! -f "$output" ] || [ ! -s "$output" ]; then
+        log_e "APK download failed - no file"
+        exit 1
     fi
-    rm -f "$output"
-
-    # Method 3: Individual splits (merge the ones with .so files)
-    log_i "  Trying split downloads..."
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    local base_apk=""
-    for i in 0 1 2 3 4; do
-        log_i "    Split $i..."
-        curl -sS -L --max-time 60 -H "User-Agent: $ua" \
-            -o "$tmp_dir/split_${i}.apk" \
-            "https://apkdl.dietdroid.com/download/${PKG_NAME}/${i}?arch=${arch}" 2>/dev/null || true
-        if [ -f "$tmp_dir/split_${i}.apk" ]; then
-            local so_count
-            so_count=$(unzip -l "$tmp_dir/split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-            local fsize
-            fsize=$(stat -c%s "$tmp_dir/split_${i}.apk" 2>/dev/null || echo 0)
-            if [ "$fsize" -gt 5000000 ]; then
-                if [ -z "$base_apk" ] || [ "$so_count" -gt 0 ]; then
-                    base_apk="$tmp_dir/split_${i}.apk"
-                fi
-            fi
-        fi
-    done
-
-    if [ -n "$base_apk" ] && [ -f "$base_apk" ]; then
-        # Merge all splits into one APK
-        cp "$base_apk" "$output"
-        for split in "$tmp_dir"/split_*.apk; do
-            [ "$split" = "$base_apk" ] && continue
-            [ ! -f "$split" ] && continue
-            local merge_dir
-            merge_dir=$(mktemp -d)
-            unzip -o "$split" -d "$merge_dir" 2>/dev/null || true
-            rm -rf "${merge_dir}/META-INF"
-            (cd "$merge_dir" && zip -r "$output" . 2>/dev/null) || true
-            rm -rf "$merge_dir"
-        done
-        rm -rf "$tmp_dir"
-        local size
-        size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-        if [ "$size" -gt 5000000 ]; then
-            log_ok "  Splits merged: $(du -h "$output" | cut -f1)"
-            return 0
-        fi
-    fi
-    rm -rf "$tmp_dir"
-    rm -f "$output"
-    log_e "All download methods failed"
-    exit 1
+    log_ok "Download complete: $(du -h "$output" | cut -f1)"
 }
 
 find_apk() {
     if [ -z "$BASE_APK" ]; then
-        # Check if base.apk exists in project root or scripts dir
         for candidate in "${PROJECT_ROOT}/base.apk" "${SCRIPT_DIR}/base.apk"; do
             if [ -f "$candidate" ] && [ -s "$candidate" ]; then
                 BASE_APK="$candidate"
@@ -172,7 +234,6 @@ find_apk() {
                 return
             fi
         done
-        # Auto-download
         BASE_APK="${BUILD_DIR}/downloaded.apk"
         mkdir -p "$BUILD_DIR"
         download_apk "$BASE_APK"
@@ -201,7 +262,6 @@ handle_xapk() {
     mkdir -p "$extracted"
     unzip -o "$apk" "$main_apk" -d "$extracted" 2>/dev/null
     BASE_APK="${extracted}/${main_apk}"
-    # Also extract arm64 libs if present
     for f in $(unzip -l "$apk" 2>/dev/null | grep 'config.arm64.*\.apk' | awk '{print $4}'); do
         log_i "  Extracting arm64 split: $f"
         unzip -o "$apk" "$f" -d "$extracted" 2>/dev/null
@@ -224,7 +284,6 @@ fix_manifest() {
     local manifest="${DECOMPILED_DIR}/AndroidManifest.xml"
     local fixes=0
 
-    # Remove split flags
     for attr in isSplitRequired requiredSplitTypes splitTypes intentMatchingFlags; do
         if grep -q "android:${attr}" "$manifest" 2>/dev/null; then
             sed -i "s/ android:${attr}=\"[^\"]*\"//g" "$manifest"
@@ -233,21 +292,18 @@ fix_manifest() {
         fi
     done
 
-    # Remove split meta-data
     if grep -q "com.android.vending.splits" "$manifest" 2>/dev/null; then
         sed -i '/com.android.vending.splits/d' "$manifest"
         log_ok "  Removed: splits meta-data"
         fixes=$((fixes + 1))
     fi
 
-    # Fix extractNativeLibs
     if grep -q 'extractNativeLibs="false"' "$manifest" 2>/dev/null; then
         sed -i 's/extractNativeLibs="false"/extractNativeLibs="true"/g' "$manifest"
         log_ok "  Fixed: extractNativeLibs=true"
         fixes=$((fixes + 1))
     fi
 
-    # Fix @null drawables (the bug: glob doesn't match res/drawable without suffix)
     local null_count=0
     for ddir in "${DECOMPILED_DIR}/res/"drawable*; do
         [ -d "$ddir" ] || continue
@@ -259,13 +315,11 @@ fix_manifest() {
         done < <(find "$ddir" -name "*.xml" -type f -print0 2>/dev/null)
     done
     [ "$null_count" -gt 0 ] && log_ok "  Fixed $null_count drawable files: @null -> transparent"
-
     [ "$fixes" -eq 0 ] && [ "$null_count" -eq 0 ] && log_i "  Nothing to fix"
 }
 
 inject_smali() {
     log_i "Injecting smali patches..."
-    # Find the smallest smali dir (least files = best place for new classes)
     local smallest_dir="" smallest_count=999999
     for dir in "${DECOMPILED_DIR}"/smali*/; do
         [ -d "$dir" ] || continue
@@ -310,8 +364,6 @@ patch_app_class() {
     for smali_dir in "${DECOMPILED_DIR}"/smali*/; do
         [ -f "${smali_dir}${smali_path}" ] && { full_path="${smali_dir}${smali_path}"; break; }
     done
-
-    # Fallback: search by class name
     if [ -z "$full_path" ]; then
         local class_name="${app_class##*.}"
         full_path=$(find "${DECOMPILED_DIR}" -path "*/smali*" -name "${class_name}.smali" -type f 2>/dev/null | head -1)
@@ -319,7 +371,6 @@ patch_app_class() {
     [ -z "$full_path" ] && { log_e "Application smali not found"; exit 1; }
     log_i "  Found: $full_path"
 
-    # Skip if already patched
     grep -q "CookieSeeder" "$full_path" 2>/dev/null && { log_w "  Already patched, skipping"; return; }
 
     local inject='    invoke-static {p0}, Lcom/hotstar/patch/CookieSeeder;->seedIfNeeded(Landroid/content/Context;)V'
@@ -331,7 +382,6 @@ patch_app_class() {
         sed -i "/invoke-super.*onCreate/a\\${inject}" "$full_path"
         log_ok "  Patched after onCreate"
     else
-        # Strategy: after first invoke-super
         sed -i '0,/invoke-super/{s/invoke-super.*/&\n'"${inject}"'/}' "$full_path"
         log_ok "  Patched after first super call"
     fi
@@ -351,14 +401,12 @@ patch_identity_repo() {
     [ -z "$id_file" ] && { log_e "  IdentityRepository (Df/d.smali) NOT FOUND"; exit 1; }
     log_i "  Found: $id_file"
 
-    # Skip if already patched
     grep -q "CookieSeeder" "$id_file" 2>/dev/null && { log_w "  Already patched, skipping"; return; }
 
     local tmp="${WORK_DIR}/patched_id.smali"
     awk '
     BEGIN { in_i = 0; in_d = 0; in_ann = 0; first_inst = 0; }
 
-    # --- Method i(): getUserToken ---
     /\.method public final i\(Lot\/d;\)Ljava\/lang\/Object;/ {
         in_i = 1; in_d = 0; in_ann = 0; first_inst = 0
         print; next
@@ -389,7 +437,6 @@ patch_identity_repo() {
         print; next
     }
 
-    # --- Method d(): getMediaToken ---
     /\.method public final d\(Lwe\/J;\)Ljava\/lang\/Object;/ {
         in_d = 1; in_i = 0; in_ann = 0; first_inst = 0
         print; next
@@ -403,14 +450,14 @@ patch_identity_repo() {
             first_inst = 1
             print ""
             print "    # === PATCH: Inject media token when field g is null ==="
-            print "    iget-object v0, p0, LDf/d;->g:Ljava/lang/String;"
+            print "    iget-object v0, p0, LDf\/d;->g:Ljava/lang/String;"
             print "    if-nez v0, :patch_orig_d"
             print ""
             print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
             print "    move-result-object v1"
             print "    if-eqz v1, :patch_orig_d"
             print ""
-            print "    iput-object v1, p0, LDf/d;->g:Ljava/lang/String;"
+            print "    iput-object v1, p0, LDf\/d;->g:Ljava/lang/String;"
             print "    return-object v1"
             print ""
             print "    :patch_orig_d"
@@ -450,49 +497,99 @@ inject_native_libs() {
         log_ok "  Native libs present ($has_libs .so files)"
         return
     fi
-    log_i "  No native libs in rebuilt APK - downloading arm64 split..."
+
+    log_i "  No native libs in rebuilt APK - looking for arm64 split..."
+
+    # Check if arm64 split was pre-downloaded by download_apk()
+    local lib_source=""
+    if [ -f "${BUILD_DIR}/arm64_split.apk" ] && [ "$(stat -c%s "${BUILD_DIR}/arm64_split.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+        local so_count
+        so_count=$(unzip -l "${BUILD_DIR}/arm64_split.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+        if [ "$so_count" -gt 0 ]; then
+            log_i "    Using pre-downloaded arm64 split ($so_count .so files)"
+            lib_source="${BUILD_DIR}/arm64_split.apk"
+        fi
+    fi
+
+    # Fallback: download from API
+    if [ -z "$lib_source" ]; then
+        log_i "    Downloading arm64 split from API..."
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        python3 -c "
+import json, subprocess, sys, time, os
+API = '${APK_DL_API}'
+PKG = '${PKG_NAME}'
+ARCH = '${ARCH}'
+proc = subprocess.Popen(['curl', '-sN', '--max-time', '120', f'{API}/api/download-info-stream/{PKG}?arch={ARCH}'],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+success = None
+for line in proc.stdout:
+    line = line.strip()
+    if line.startswith('data: '):
+        try:
+            d = json.loads(line[6:])
+            if d.get('type') == 'success':
+                success = d
+                break
+        except: pass
+proc.terminate(); proc.wait(timeout=10)
+if success:
+    cookies = success.get('cookies', [])
+    cookie_str = '; '.join([f\"{c['name']}={c['value']}\" for c in cookies])
+    for s in success.get('splits', []):
+        if 'arm64' in s.get('name', '').lower():
+            url = s.get('downloadUrl', '')
+            if url:
+                cmd = ['curl', '-sS', '-L', '--max-time', '300', '-o', '${tmp_dir}/arm64.apk']
+                if cookie_str:
+                    cmd += ['-H', f'Cookie: {cookie_str}']
+                cmd.append(url)
+                subprocess.run(cmd)
+                break
+" 2>/dev/null
+
+        if [ -f "${tmp_dir}/arm64.apk" ] && [ "$(stat -c%s "${tmp_dir}/arm64.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+            local so_count
+            so_count=$(unzip -l "${tmp_dir}/arm64.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+            if [ "$so_count" -gt 0 ]; then
+                lib_source="${tmp_dir}/arm64.apk"
+                log_i "    Downloaded arm64 split ($so_count .so files)"
+            fi
+        fi
+        rm -rf "$tmp_dir" 2>/dev/null
+    fi
+
+    if [ -z "$lib_source" ]; then
+        log_w "  Could not get arm64 split - app may crash on launch"
+        return
+    fi
+
+    # Extract and inject native libs
     local lib_tmp="${WORK_DIR}/arm64_tmp"
     rm -rf "$lib_tmp"
     mkdir -p "$lib_tmp"
-    local lib_found=false
-    for i in 0 1 2 3 4; do
-        curl -sS -L --max-time 60 -o "$lib_tmp/split_${i}.apk" \
-            "https://apkdl.dietdroid.com/download/${PKG_NAME}/${i}?arch=arm64-v8a" 2>/dev/null || true
-        if [ -f "$lib_tmp/split_${i}.apk" ]; then
-            local so_count
-            so_count=$(unzip -l "$lib_tmp/split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-            if [ "$so_count" -gt 0 ]; then
-                log_i "    Split $i has $so_count .so files - merging"
-                unzip -o "$lib_tmp/split_${i}.apk" "lib/*" -d "$lib_tmp" 2>/dev/null || true
-                lib_found=true
-                break
-            fi
-        fi
-    done
-    if [ "$lib_found" = true ]; then
-        local unsigned="${BUILD_DIR}/unsigned.apk"
-        cp "$PATCHED_APK" "$unsigned"
-        # Remove old signatures
-        zip -d "$unsigned" "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.MF" 2>/dev/null || true
-        # Add native libs
-        (cd "$lib_tmp" && zip -r "$unsigned" lib/ 2>/dev/null)
-        rm -rf "$lib_tmp"
-        # Realign and sign
-        local aligned="${BUILD_DIR}/aligned_lib.apk"
-        zipalign -f 4 "$unsigned" "$aligned"
-        rm -f "$unsigned"
-        generate_keystore
-        apksigner sign --ks "$KEYSTORE" --ks-pass "pass:${KEYSTORE_PASS}" \
-            --ks-key-alias "$KEY_ALIAS" --key-pass "pass:${KEYSTORE_PASS}" \
-            --out "$PATCHED_APK" "$aligned" 2>/dev/null
-        rm -f "$aligned"
-        local final_libs
-        final_libs=$(unzip -l "$PATCHED_APK" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-        log_ok "  Injected $final_libs arm64 native libs"
-    else
-        rm -rf "$lib_tmp"
-        log_w "  Could not download arm64 libs - app may crash"
-    fi
+    log_i "    Extracting native libs..."
+    unzip -o "$lib_source" "lib/*" -d "$lib_tmp" 2>/dev/null || true
+
+    local unsigned="${BUILD_DIR}/unsigned.apk"
+    cp "$PATCHED_APK" "$unsigned"
+    zip -d "$unsigned" "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.MF" 2>/dev/null || true
+    (cd "$lib_tmp" && zip -r "$unsigned" lib/ 2>/dev/null)
+    rm -rf "$lib_tmp"
+
+    local aligned="${BUILD_DIR}/aligned_lib.apk"
+    zipalign -f 4 "$unsigned" "$aligned"
+    rm -f "$unsigned"
+    generate_keystore
+    apksigner sign --ks "$KEYSTORE" --ks-pass "pass:${KEYSTORE_PASS}" \
+        --ks-key-alias "$KEY_ALIAS" --key-pass "pass:${KEYSTORE_PASS}" \
+        --out "$PATCHED_APK" "$aligned" 2>/dev/null
+    rm -f "$aligned"
+
+    local final_libs
+    final_libs=$(unzip -l "$PATCHED_APK" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+    log_ok "  Injected $final_libs arm64 native libs"
 }
 
 generate_keystore() {
