@@ -19,6 +19,7 @@ on:
 env:
   PACKAGE_NAME: in.startv.hotstar
   ARCH: arm64-v8a
+  APK_DL_API: https://gplay-apk-downloader-zyuj.onrender.com
 
 jobs:
   build:
@@ -78,64 +79,144 @@ jobs:
           fi
           echo "All cookies validated."
 
-      - name: Download APK from DietDroid
+      - name: Download APK
         id: download
+        env:
+          APK_DL_API: ${{ env.APK_DL_API }}
         run: |
-          PKG="${{ env.PACKAGE_NAME }}"
-          ARCH="${{ env.ARCH }}"
-          VERSION="${{ inputs.version }}"
+          python3 << 'PYEOF'
+          import json, subprocess, sys, time, os
 
-          echo "Downloading ${PKG} (${ARCH}) from DietDroid..."
+          API = os.environ['APK_DL_API']
+          PKG = os.environ['PACKAGE_NAME']
+          ARCH = os.environ['ARCH']
 
-          echo "Trying merged endpoint..."
-          MERGED_RESP=$(curl -sS -f --max-time 180 \
-            "https://apkdl.dietdroid.com/api/download-merged/${PKG}?arch=${ARCH}" \
-            -o jiohotstar.apk -w "%{http_code}" 2>/dev/null) || MERGED_RESP="000"
+          def parse_sse(endpoint, max_wait=180):
+              """Call an SSE endpoint and return the first success event as JSON."""
+              print(f"  Connecting to {endpoint}", flush=True)
+              proc = subprocess.Popen(
+                  ['curl', '-sN', '--max-time', str(max_wait), endpoint],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+              )
+              success_data = None
+              start = time.time()
+              for line in proc.stdout:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if line.startswith('data: '):
+                      try:
+                          data = json.loads(line[6:])
+                          if data.get('type') == 'progress':
+                              msg = data.get('message', '')
+                              print(f"  [SSE] {msg}", flush=True)
+                          elif data.get('type') == 'success':
+                              success_data = data
+                              break
+                      except json.JSONDecodeError:
+                          pass
+                  if time.time() - start > max_wait:
+                      print("  [SSE] Timeout reached", flush=True)
+                      break
+              proc.terminate()
+              try:
+                  proc.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+              return success_data
 
-          if [ "$MERGED_RESP" = "200" ] && [ -f jiohotstar.apk ] && [ "$(stat -c%s jiohotstar.apk)" -gt 5000000 ]; then
-            echo "Merged download succeeded: $(du -h jiohotstar.apk | cut -f1)"
-          else
-            echo "Merged endpoint failed (HTTP $MERGED_RESP), trying base APK fallback..."
-            rm -f jiohotstar.apk
-            curl -sS -L --max-time 180 \
-              "https://apkdl.dietdroid.com/download/${PKG}?arch=${ARCH}" \
-              -o jiohotstar.apk 2>/dev/null || true
+          def download_file(url, output, cookie_str="", max_time=300):
+              """Download a file with optional cookie header."""
+              cmd = ['curl', '-sS', '-L', '--max-time', str(max_time), '-o', output]
+              if cookie_str:
+                  cmd += ['-H', f'Cookie: {cookie_str}']
+              cmd.append(url)
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              return os.path.exists(output) and os.path.getsize(output) > 0
 
-            if [ ! -f jiohotstar.apk ] || [ "$(stat -c%s jiohotstar.apk 2>/dev/null || echo 0)" -lt 5000000 ]; then
-              echo "Base APK too small, trying individual splits..."
-              rm -f jiohotstar.apk
-              for i in 0 1 2 3 4; do
-                echo "  Trying split $i..."
-                curl -sS -L --max-time 60 \
-                  "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
-                  -o "split_${i}.apk" 2>/dev/null || true
-                if [ -f "split_${i}.apk" ] && [ "$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
-                  SO_COUNT=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-                  if [ "$SO_COUNT" -gt 0 ]; then
-                    echo "  Split $i has $SO_COUNT arm64 libs, using as source"
-                    cp "split_${i}.apk" jiohotstar.apk
-                    break
-                  fi
-                fi
-                rm -f "split_${i}.apk"
-              done
-            fi
-          fi
+          def fmt_size(path):
+              s = os.path.getsize(path)
+              return f"{s / 1024 / 1024:.1f} MB"
 
-          if [ ! -f jiohotstar.apk ]; then
-            echo "::error::Failed to download APK from DietDroid"
-            exit 1
-          fi
+          print(f"=== Downloading {PKG} ({ARCH}) ===", flush=True)
+          print(f"API: {API}", flush=True)
 
-          SIZE=$(stat -c%s jiohotstar.apk)
-          if [ "$SIZE" -lt 1000000 ]; then
-            echo "::error::Downloaded file too small ($SIZE bytes)"
-            file jiohotstar.apk
-            exit 1
-          fi
+          # Method 1: Merged download (server-side merge+sign)
+          print("\nMethod 1: Merged download via SSE stream...", flush=True)
+          merged = parse_sse(f"{API}/api/download-merged-stream/{PKG}?arch={ARCH}", max_wait=300)
 
-          echo "Downloaded: $(du -h jiohotstar.apk | cut -f1)"
-          echo "downloaded_size=$(du -h jiohotstar.apk | cut -f1)" >> $GITHUB_OUTPUT
+          if merged and merged.get('download_id'):
+              dl_id = merged['download_id']
+              print(f"  Got download_id: {dl_id}", flush=True)
+              print(f"  Downloading merged APK...", flush=True)
+              if download_file(f"{API}/api/download-temp/{dl_id}", 'jiohotstar.apk'):
+                  if os.path.getsize('jiohotstar.apk') > 5000000:
+                      print(f"  SUCCESS: Merged APK {fmt_size('jiohotstar.apk')}", flush=True)
+                      with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                          f.write(f"downloaded_size={fmt_size('jiohotstar.apk')}\n")
+                      sys.exit(0)
+                  else:
+                      print(f"  Merged APK too small ({os.path.getsize('jiohotstar.apk')} bytes)", flush=True)
+              else:
+                  print(f"  Failed to download merged APK from temp endpoint", flush=True)
+          else:
+              print(f"  Merged download did not return download_id (may have timed out for large app)", flush=True)
+
+          os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
+
+          # Method 2: Direct CDN download via info stream
+          print("\nMethod 2: Direct CDN download via info stream...", flush=True)
+          info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=120)
+
+          if not info:
+              print("::error::Failed to get download info from API")
+              sys.exit(1)
+
+          dl_url = info.get('downloadUrl')
+          cookies_list = info.get('cookies', [])
+          cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies_list]) if cookies_list else ''
+          splits = info.get('splits', [])
+
+          print(f"  App: {info.get('title', PKG)}", flush=True)
+          print(f"  Version: {info.get('version')} (code: {info.get('versionCode')})", flush=True)
+          print(f"  Base: {info.get('filename')} ({info.get('size')})", flush=True)
+          print(f"  Cookie: {cookie_str}", flush=True)
+          print(f"  Splits available: {len(splits)}", flush=True)
+          for sp in splits:
+              print(f"    - {sp.get('name')}: {sp.get('size', 0) // 1024 // 1024} MB", flush=True)
+
+          if not dl_url:
+              print("::error::No download URL in info response")
+              sys.exit(1)
+
+          print(f"\n  Downloading base APK from Google CDN...", flush=True)
+          if not download_file(dl_url, 'jiohotstar.apk', cookie_str, 300):
+              print("::error::Base APK download failed")
+              sys.exit(1)
+
+          if os.path.getsize('jiohotstar.apk') < 1000000:
+              sz = os.path.getsize('jiohotstar.apk')
+              print(f"::error::Base APK too small ({sz} bytes)")
+              sys.exit(1)
+
+          print(f"  SUCCESS: Base APK {fmt_size('jiohotstar.apk')}", flush=True)
+
+          for split in splits:
+              if 'arm64' in split.get('name', '').lower():
+                  split_url = split.get('downloadUrl')
+                  if split_url:
+                      print(f"\n  Pre-downloading arm64 split ({split.get('name')}) for native lib injection...", flush=True)
+                      if download_file(split_url, 'arm64_split.apk', cookie_str, 300):
+                          print(f"  Arm64 split saved: {fmt_size('arm64_split.apk')}", flush=True)
+                      else:
+                          print(f"  WARNING: Arm64 split download failed, will retry during injection", flush=True)
+                  break
+
+          print(f"\n=== Download complete: {fmt_size('jiohotstar.apk')} ===", flush=True)
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              f.write(f"downloaded_size={fmt_size('jiohotstar.apk')}\n")
+
+          PYEOF
 
       - name: Decompile APK
         id: decompile
@@ -332,7 +413,7 @@ jobs:
               first_inst = 1
               print ""
               print "    # PATCH: inject media token when field g is null"
-              print "    iget-object v0, p0, LDf/d;->g:Ljava/lang/String;"
+              print "    iget-object v0, p0, LDf\/d;->g:Ljava/lang/String;"
               print "    if-nez v0, :patch_orig_d"
               print ""
               print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
@@ -374,49 +455,95 @@ jobs:
 
       - name: Inject native libs (if missing)
         if: steps.native_check.outputs.lib_count == '0'
+        env:
+          APK_DL_API: ${{ env.APK_DL_API }}
         run: |
-          echo "No native libs found, downloading arm64 split..."
+          echo "No native libs found, need arm64 split..."
           PKG="${{ env.PACKAGE_NAME }}"
           ARCH="${{ env.ARCH }}"
+          API="${{ env.APK_DL_API }}"
+          LIB_SOURCE=""
 
-          for i in 0 1 2 3 4; do
-            echo "Trying split $i..."
-            curl -sS -L --max-time 60 \
-              "https://apkdl.dietdroid.com/download/${PKG}/${i}?arch=${ARCH}" \
-              -o "split_${i}.apk" 2>/dev/null || true
+          if [ -f arm64_split.apk ] && [ "$(stat -c%s arm64_split.apk 2>/dev/null || echo 0)" -gt 1000000 ]; then
+            SO_COUNT=$(unzip -l arm64_split.apk 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+            if [ "$SO_COUNT" -gt 0 ]; then
+              echo "Using pre-downloaded arm64 split ($SO_COUNT .so files)"
+              LIB_SOURCE="arm64_split.apk"
+            fi
+          fi
 
-            if [ -f "split_${i}.apk" ] && [ "$(stat -c%s "split_${i}.apk" 2>/dev/null || echo 0)" -gt 1000000 ]; then
-              SO_COUNT=$(unzip -l "split_${i}.apk" 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
-              if [ "$SO_COUNT" -gt 0 ]; then
-                echo "Split $i has $SO_COUNT arm64 libs"
-                mkdir -p lib_tmp
-                unzip -o "split_${i}.apk" "lib/*" -d lib_tmp 2>/dev/null || true
+          if [ -z "$LIB_SOURCE" ]; then
+            echo "Downloading arm64 split info from API..."
+            ARM64_INFO=$(curl -sN --max-time 120 "${API}/api/download-info-stream/${PKG}?arch=${ARCH}" 2>/dev/null | while IFS= read -r line; do
+              if echo "$line" | grep -q '"type":"success"'; then
+                echo "$line" | sed 's/^data: //'
                 break
               fi
+            done)
+
+            if [ -n "$ARM64_INFO" ]; then
+              ARM64_URL=$(echo "$ARM64_INFO" | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              for s in data.get('splits', []):
+                  if 'arm64' in s.get('name', '').lower():
+                      print(s.get('downloadUrl', ''))
+                      break
+              " 2>/dev/null)
+
+              COOKIE_STR=$(echo "$ARM64_INFO" | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              cookies = data.get('cookies', [])
+              print('; '.join([f\"{c['name']}={c['value']}\" for c in cookies]))
+              " 2>/dev/null)
+
+              if [ -n "$ARM64_URL" ]; then
+                echo "Downloading arm64 split from Google CDN..."
+                curl -sS -L --max-time 300 -H "Cookie: ${COOKIE_STR}" \
+                  -o arm64_fallback.apk "$ARM64_URL" 2>/dev/null
+                if [ -f arm64_fallback.apk ] && [ "$(stat -c%s arm64_fallback.apk 2>/dev/null || echo 0)" -gt 1000000 ]; then
+                  SO_COUNT=$(unzip -l arm64_fallback.apk 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
+                  if [ "$SO_COUNT" -gt 0 ]; then
+                    echo "Downloaded arm64 split ($SO_COUNT .so files)"
+                    LIB_SOURCE="arm64_fallback.apk"
+                  fi
+                fi
+              fi
             fi
-            rm -f "split_${i}.apk"
-          done
+          fi
 
-          [ ! -d lib_tmp ] && { echo "::warning::No arm64 source for lib injection"; exit 0; }
+          if [ -z "$LIB_SOURCE" ]; then
+            echo "WARNING: Could not get arm64 split, app may lack native libraries"
+          fi
 
-          cp jiohotstar_unsigned.apk jiohotstar_mod.apk
-          zip -d jiohotstar_mod.apk "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.MF" 2>/dev/null || true
-          (cd lib_tmp && zip -r ../jiohotstar_mod.apk lib/ 2>/dev/null)
-          rm -rf lib_tmp
+          if [ -n "$LIB_SOURCE" ]; then
+            echo "Extracting native libs from $LIB_SOURCE..."
+            mkdir -p lib_tmp
+            unzip -o "$LIB_SOURCE" "lib/*" -d lib_tmp 2>/dev/null || true
 
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ 2>/dev/null | sort -V | tail -1)
-          export PATH="${BUILD_TOOLS}:${PATH}"
+            cp jiohotstar_unsigned.apk jiohotstar_mod.apk
+            zip -d jiohotstar_mod.apk "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.MF" 2>/dev/null || true
+            (cd lib_tmp && zip -r ../jiohotstar_mod.apk lib/ 2>/dev/null)
+            rm -rf lib_tmp
 
-          zipalign -f 4 jiohotstar_mod.apk jiohotstar_aligned.apk
-          keytool -genkeypair -v -keystore sign.keystore -alias hotstar -keyalg RSA \
-            -keysize 2048 -validity 10000 -storepass hotstarpatch -keypass hotstarpatch \
-            -dname "CN=Patcher, OU=Patch, O=HP, L=X, ST=X, C=XX" 2>/dev/null
-          apksigner sign --ks sign.keystore --ks-pass pass:hotstarpatch \
-            --ks-key-alias hotstar --key-pass pass:hotstarpatch \
-            --out jiohotstar_patched.apk jiohotstar_aligned.apk 2>/dev/null
+            BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+            export PATH="${BUILD_TOOLS}:${PATH}"
 
-          echo "Native lib injection complete"
-          rm -f jiohotstar_mod.apk jiohotstar_aligned.apk
+            zipalign -f 4 jiohotstar_mod.apk jiohotstar_aligned.apk
+            keytool -genkeypair -v -keystore sign.keystore -alias hotstar -keyalg RSA \
+              -keysize 2048 -validity 10000 -storepass hotstarpatch -keypass hotstarpatch \
+              -dname "CN=Patcher, OU=Patch, O=HP, L=X, ST=X, C=XX" 2>/dev/null
+            apksigner sign --ks sign.keystore --ks-pass pass:hotstarpatch \
+              --ks-key-alias hotstar --key-pass pass:hotstarpatch \
+              --out jiohotstar_patched.apk jiohotstar_aligned.apk 2>/dev/null
+
+            echo "Native lib injection complete"
+            rm -f jiohotstar_mod.apk jiohotstar_aligned.apk arm64_fallback.apk
+          else
+            echo "No arm64 split available, skipping native lib injection"
+            cp jiohotstar_unsigned.apk jiohotstar_patched.apk
+          fi
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
 
