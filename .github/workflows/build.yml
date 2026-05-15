@@ -383,14 +383,14 @@ jobs:
               first_inst = 1
               print ""
               print "    # PATCH: inject user token when field a is null"
-              print "    iget-object v0, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    iget-object v0, p0, LDf\/d;->a:Ljava/lang/String;"
               print "    if-nez v0, :patch_orig_i"
               print ""
               print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
               print "    move-result-object v1"
               print "    if-eqz v1, :patch_orig_i"
               print ""
-              print "    iput-object v1, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    iput-object v1, p0, LDf\/d;->a:Ljava/lang/String;"
               print "    return-object v1"
               print ""
               print "    :patch_orig_i"
@@ -420,7 +420,7 @@ jobs:
               print "    move-result-object v1"
               print "    if-eqz v1, :patch_orig_d"
               print ""
-              print "    iput-object v1, p0, LDf/d;->g:Ljava/lang/String;"
+              print "    iput-object v1, p0, LDf\/d;->g:Ljava/lang/String;"
               print "    return-object v1"
               print ""
               print "    :patch_orig_d"
@@ -457,6 +457,7 @@ jobs:
         if: steps.native_check.outputs.lib_count == '0'
         env:
           APK_DL_API: ${{ env.APK_DL_API }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           echo "No native libs found, need arm64 split..."
           PKG="${{ env.PACKAGE_NAME }}"
@@ -464,6 +465,7 @@ jobs:
           API="${{ env.APK_DL_API }}"
           LIB_SOURCE=""
 
+          # First check if arm64 split was pre-downloaded in the download step
           if [ -f arm64_split.apk ] && [ "$(stat -c%s arm64_split.apk 2>/dev/null || echo 0)" -gt 1000000 ]; then
             SO_COUNT=$(unzip -l arm64_split.apk 2>/dev/null | grep -c "lib/arm64.*\.so" || true)
             if [ "$SO_COUNT" -gt 0 ]; then
@@ -472,6 +474,7 @@ jobs:
             fi
           fi
 
+          # Fallback: download arm64 split from API
           if [ -z "$LIB_SOURCE" ]; then
             echo "Downloading arm64 split info from API..."
             ARM64_INFO=$(curl -sN --max-time 120 "${API}/api/download-info-stream/${PKG}?arch=${ARCH}" 2>/dev/null | while IFS= read -r line; do
@@ -513,6 +516,7 @@ jobs:
             fi
           fi
 
+          # Second fallback: try merged download of a small test to check API health, then try splits
           if [ -z "$LIB_SOURCE" ]; then
             echo "WARNING: Could not get arm64 split, app may lack native libraries"
           fi
@@ -544,11 +548,11 @@ jobs:
             echo "No arm64 split available, skipping native lib injection"
             cp jiohotstar_unsigned.apk jiohotstar_patched.apk
           fi
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
 
       - name: Sign APK (when libs already present)
         if: steps.native_check.outputs.lib_count != '0'
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ 2>/dev/null | sort -V | tail -1)
           export PATH="${BUILD_TOOLS}:${PATH}"
@@ -564,8 +568,6 @@ jobs:
 
           apksigner verify jiohotstar_patched.apk 2>/dev/null && echo "Signature: OK" || echo "Signature: verify failed (may still work)"
           rm -f jiohotstar_aligned.apk
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
 
       - name: Final APK info
         id: final
