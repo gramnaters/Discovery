@@ -70,16 +70,16 @@
     const-string v6, "cached_user_token"
     invoke-interface {v4, v6, v3}, Landroid/content/SharedPreferences;->getString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
     move-result-object v7
-    if-eqz v7, :restore_skip_token
+    if-eqz v7, :skip_user_restore
     sput-object v7, Lcom/hotstar/patch/CookieSeeder;->injectedUserToken:Ljava/lang/String;
-    :restore_skip_token
+    :skip_user_restore
 
     const-string v6, "cached_media_token"
     invoke-interface {v4, v6, v3}, Landroid/content/SharedPreferences;->getString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
     move-result-object v7
-    if-eqz v7, :restore_skip_media
+    if-eqz v7, :skip_media_restore
     sput-object v7, Lcom/hotstar/patch/CookieSeeder;->injectedMediaToken:Ljava/lang/String;
-    :restore_skip_media
+    :skip_media_restore
 
     const-string v3, "Already seeded, restored static fields from prefs"
     invoke-static {v0, v3}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I

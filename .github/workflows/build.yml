@@ -375,6 +375,17 @@ jobs:
           fi
 
           awk '
+          function bump_locals(line) {
+              if (line ~ /\.locals [0-9]+$/) {
+                  split(line, a, " ")
+                  if (a[2] + 0 < 2) { sub(/\.locals [0-9]+$/, ".locals 2", line) }
+              }
+              if (line ~ /\.registers [0-9]+$/) {
+                  split(line, a, " ")
+                  if (a[2] + 0 < 4) { sub(/\.registers [0-9]+$/, ".registers 4", line) }
+              }
+              return line
+          }
           BEGIN { in_c = 0; in_i = 0; in_ann = 0; first_inst = 0; }
 
           /\.method public final c\(Ltt\/d;\)Ljava\/lang\/Object;/ {
@@ -382,7 +393,7 @@ jobs:
             print; next
           }
           in_c == 1 {
-            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+            if (/\.locals [0-9]+$/ || /\.registers [0-9]+$/) { $0 = bump_locals($0); print; next }
             if (/\.annotation build/) { in_ann = 1 }
             if (/\.end annotation/) { in_ann = 0 }
             if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
@@ -412,7 +423,7 @@ jobs:
             print; next
           }
           in_i == 1 {
-            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+            if (/\.locals [0-9]+$/ || /\.registers [0-9]+$/) { $0 = bump_locals($0); print; next }
             if (/\.annotation build/) { in_ann = 1 }
             if (/\.end annotation/) { in_ann = 0 }
             if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }

@@ -411,7 +411,9 @@ patch_identity_repo() {
         print; next
     }
     in_c == 1 {
-        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+        if (/\.locals [0-9]+$/) { n=$2+0; if(n<2) sub(/\.locals [0-9]+$/, ".locals 2") }
+        if (/\.registers [0-9]+$/) { n=$2+0; if(n<4) sub(/\.registers [0-9]+$/, ".registers 4") }
+        if (/\.locals [0-9]+$/ || /\.registers [0-9]+$/) { print; next }
         if (/\.annotation build/) { in_ann = 1 }
         if (/\.end annotation/) { in_ann = 0 }
         if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
@@ -441,7 +443,9 @@ patch_identity_repo() {
         print; next
     }
     in_i == 1 {
-        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+        if (/\.locals [0-9]+$/) { n=$2+0; if(n<2) sub(/\.locals [0-9]+$/, ".locals 2") }
+        if (/\.registers [0-9]+$/) { n=$2+0; if(n<4) sub(/\.registers [0-9]+$/, ".registers 4") }
+        if (/\.locals [0-9]+$/ || /\.registers [0-9]+$/) { print; next }
         if (/\.annotation build/) { in_ann = 1 }
         if (/\.end annotation/) { in_ann = 0 }
         if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
@@ -463,71 +467,6 @@ patch_identity_repo() {
             print ""
         }
         if (/^\.end method/) { in_i = 0 }
-        print; next
-    }
-
-    { print }
-    ' "$id_file" > "$tmp"
-
-    [ ! -s "$tmp" ] && { log_e "  AWK produced empty output"; exit 1; }
-    mv "$tmp" "$id_file"
-
-    grep -q "getInjectedUserToken" "$id_file" && log_ok "  getUserToken patch: OK" || { log_e "  getUserToken patch FAILED"; exit 1; }
-    grep -q "getInjectedMediaToken" "$id_file" && log_ok "  getMediaToken patch: OK" || { log_e "  getMediaToken patch FAILED"; exit 1; }
-}
-    in_i == 1 {
-        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
-        if (/\.annotation build/) { in_ann = 1 }
-        if (/\.end annotation/) { in_ann = 0 }
-        if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
-        if (/iget-object v0, p0, LDf\/d;->a:Ljava\/lang\/String;/ && first_inst == 0) {
-            first_inst = 1
-            print ""
-            print "    # === PATCH: Inject user token when field a is null ==="
-            print "    iget-object v0, p0, LDf/d;->a:Ljava/lang/String;"
-            print "    if-nez v0, :patch_orig_i"
-            print ""
-            print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
-            print "    move-result-object v1"
-            print "    if-eqz v1, :patch_orig_i"
-            print ""
-            print "    iput-object v1, p0, LDf/d;->a:Ljava/lang/String;"
-            print "    return-object v1"
-            print ""
-            print "    :patch_orig_i"
-            print ""
-        }
-        if (/^\.end method/) { in_i = 0 }
-        print; next
-    }
-
-    /\.method public final d\(Lwe\/J;\)Ljava\/lang\/Object;/ {
-        in_d = 1; in_i = 0; in_ann = 0; first_inst = 0
-        print; next
-    }
-    in_d == 1 {
-        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
-        if (/\.annotation build/) { in_ann = 1 }
-        if (/\.end annotation/) { in_ann = 0 }
-        if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
-        if (/iget-object v0, p0, LDf\/d;->g:Ljava\/lang\/String;/ && first_inst == 0) {
-            first_inst = 1
-            print ""
-            print "    # === PATCH: Inject media token when field g is null ==="
-            print "    iget-object v0, p0, LDf\/d;->g:Ljava/lang/String;"
-            print "    if-nez v0, :patch_orig_d"
-            print ""
-            print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
-            print "    move-result-object v1"
-            print "    if-eqz v1, :patch_orig_d"
-            print ""
-            print "    iput-object v1, p0, LDf\/d;->g:Ljava/lang/String;"
-            print "    return-object v1"
-            print ""
-            print "    :patch_orig_d"
-            print ""
-        }
-        if (/^\.end method/) { in_d = 0 }
         print; next
     }
 
