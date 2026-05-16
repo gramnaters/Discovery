@@ -375,15 +375,14 @@ patch_app_class() {
 
     local inject='    invoke-static {p0}, Lcom/hotstar/patch/CookieSeeder;->seedIfNeeded(Landroid/content/Context;)V'
 
-    if grep -q "invoke-super.*attachBaseContext" "$full_path"; then
-        sed -i "/invoke-super.*attachBaseContext/a\\${inject}" "$full_path"
-        log_ok "  Patched after attachBaseContext"
-    elif grep -q "invoke-super.*onCreate" "$full_path"; then
-        sed -i "/invoke-super.*onCreate/a\\${inject}" "$full_path"
-        log_ok "  Patched after onCreate"
+    local line_num
+    line_num=$(grep -n "invoke-super" "$full_path" | head -1 | cut -d: -f1)
+    if [ -n "$line_num" ]; then
+        sed -i "${line_num}a\\${inject}" "$full_path"
+        log_ok "  Patched after invoke-super (line $line_num)"
     else
-        sed -i '0,/invoke-super/{s/invoke-super.*/&\n'"${inject}"'/}' "$full_path"
-        log_ok "  Patched after first super call"
+        log_e "  No invoke-super found in Application class"
+        exit 1
     fi
 
     grep -q "CookieSeeder" "$full_path" && log_ok "  Verified OK" || { log_e "  Patch verification FAILED"; exit 1; }
@@ -398,7 +397,7 @@ patch_identity_repo() {
             break
         fi
     done
-    [ -z "$id_file" ] && { log_e "  IdentityRepository (Df/d.smali) NOT FOUND"; exit 1; }
+    [ -z "$id_file" ] && { log_w "  IdentityRepository (Df/d.smali) NOT FOUND - skipping"; return; }
     log_i "  Found: $id_file"
 
     grep -q "CookieSeeder" "$id_file" 2>/dev/null && { log_w "  Already patched, skipping"; return; }
