@@ -621,13 +621,6 @@ jobs:
           path: JioHotstar-Premium-*.apk
           retention-days: 7
 
-      - name: Delete old release assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          git push origin :refs/tags/latest 2>/dev/null || true
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
