@@ -125,19 +125,6 @@ jobs:
                   proc.kill()
               return success_data
 
-          def fetch_json(url, max_wait=60):
-              """Simple GET and return parsed JSON."""
-              try:
-                  result = subprocess.run(
-                      ['curl', '-sS', '--max-time', str(max_wait), url],
-                      capture_output=True, text=True, timeout=max_wait + 10
-                  )
-                  if result.returncode == 0 and result.stdout:
-                      return json.loads(result.stdout)
-              except Exception as e:
-                  print(f"  fetch_json error: {e}", flush=True)
-              return None
-
           def download_file(url, output, cookie_str="", max_time=300):
               """Download a file with optional cookie header."""
               cmd = ['curl', '-sS', '-L', '--max-time', str(max_time), '-o', output]
@@ -201,22 +188,21 @@ jobs:
           print(f"=== Downloading {PKG} ({ARCH}) ===", flush=True)
           print(f"API: {API}", flush=True)
 
-          # Method 0: Direct JSON download info (most reliable)
-          print("\nMethod 0: Direct download info via JSON API...", flush=True)
-          info = fetch_json(f"{API}/api/download-info/{PKG}?arch={ARCH}")
-          if info and info.get('success') and info.get('downloadUrl'):
+          # Method 1: Try download-info-stream SSE first (simpler than merged, handles auth internally)
+          print("\nMethod 1: Direct CDN download via info stream SSE...", flush=True)
+          info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=180)
+          if info and info.get('downloadUrl'):
               if process_download_info(info):
                   sys.exit(0)
               else:
-                  print("  Method 0 download failed, trying fallbacks...", flush=True)
+                  os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
           else:
-              err = info.get('error') if info else 'no response'
-              print(f"  Method 0 failed: {err}", flush=True)
+              print(f"  Method 1: no download URL from info stream", flush=True)
 
           os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
 
-          # Method 1: Merged download (server-side merge+sign)
-          print("\nMethod 1: Merged download via SSE stream...", flush=True)
+          # Method 2: Merged download via merged-stream SSE (fallback, may time out for large apps)
+          print("\nMethod 2: Merged download via SSE stream...", flush=True)
           merged = parse_sse(f"{API}/api/download-merged-stream/{PKG}?arch={ARCH}", max_wait=300)
 
           if merged and merged.get('download_id'):
@@ -236,18 +222,8 @@ jobs:
           else:
               print(f"  Merged download did not return download_id (may have timed out for large app)", flush=True)
 
-          os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
-
-          # Method 2: Direct CDN download via info stream (SSE fallback)
-          print("\nMethod 2: Direct CDN download via info stream...", flush=True)
-          info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=120)
-
-          if not info:
-              print("::error::Failed to get download info from API (all methods exhausted)")
-              sys.exit(1)
-
-          if process_download_info(info):
-              sys.exit(0)
+          print("::error::All download methods exhausted")
+          sys.exit(1)
           else:
               print("::error::Download failed after getting info")
               sys.exit(1)
