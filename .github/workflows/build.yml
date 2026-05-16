@@ -224,9 +224,6 @@ jobs:
 
           print("::error::All download methods exhausted")
           sys.exit(1)
-          else:
-              print("::error::Download failed after getting info")
-              sys.exit(1)
 
           PYEOF
 
