@@ -125,6 +125,19 @@ jobs:
                   proc.kill()
               return success_data
 
+          def fetch_json(url, max_wait=60):
+              """Simple GET and return parsed JSON."""
+              try:
+                  result = subprocess.run(
+                      ['curl', '-sS', '--max-time', str(max_wait), url],
+                      capture_output=True, text=True, timeout=max_wait + 10
+                  )
+                  if result.returncode == 0 and result.stdout:
+                      return json.loads(result.stdout)
+              except Exception as e:
+                  print(f"  fetch_json error: {e}", flush=True)
+              return None
+
           def download_file(url, output, cookie_str="", max_time=300):
               """Download a file with optional cookie header."""
               cmd = ['curl', '-sS', '-L', '--max-time', str(max_time), '-o', output]
@@ -138,8 +151,69 @@ jobs:
               s = os.path.getsize(path)
               return f"{s / 1024 / 1024:.1f} MB"
 
+          def process_download_info(info):
+              """Extract download info and download base + arm64 split."""
+              dl_url = info.get('downloadUrl')
+              cookies_list = info.get('cookies', [])
+              cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies_list]) if cookies_list else ''
+              splits = info.get('splits', [])
+
+              print(f"  App: {info.get('title', PKG)}", flush=True)
+              print(f"  Version: {info.get('version')} (code: {info.get('versionCode')})", flush=True)
+              print(f"  Base: {info.get('filename')} ({info.get('size')})", flush=True)
+              print(f"  Cookie: {cookie_str}", flush=True)
+              print(f"  Splits available: {len(splits)}", flush=True)
+              for sp in splits:
+                  print(f"    - {sp.get('name')}: {sp.get('size', 0) // 1024 // 1024} MB", flush=True)
+
+              if not dl_url:
+                  print("::error::No download URL in info response")
+                  return False
+
+              print(f"\n  Downloading base APK from Google CDN...", flush=True)
+              if not download_file(dl_url, 'jiohotstar.apk', cookie_str, 300):
+                  print("::error::Base APK download failed")
+                  return False
+
+              if os.path.getsize('jiohotstar.apk') < 1000000:
+                  sz = os.path.getsize('jiohotstar.apk')
+                  print(f"::error::Base APK too small ({sz} bytes)")
+                  return False
+
+              print(f"  SUCCESS: Base APK {fmt_size('jiohotstar.apk')}", flush=True)
+
+              for split in splits:
+                  if 'arm64' in split.get('name', '').lower():
+                      split_url = split.get('downloadUrl')
+                      if split_url:
+                          print(f"\n  Pre-downloading arm64 split ({split.get('name')}) for native lib injection...", flush=True)
+                          if download_file(split_url, 'arm64_split.apk', cookie_str, 300):
+                              print(f"  Arm64 split saved: {fmt_size('arm64_split.apk')}", flush=True)
+                          else:
+                              print(f"  WARNING: Arm64 split download failed, will retry during injection", flush=True)
+                      break
+
+              print(f"\n=== Download complete: {fmt_size('jiohotstar.apk')} ===", flush=True)
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write(f"downloaded_size={fmt_size('jiohotstar.apk')}\n")
+              return True
+
           print(f"=== Downloading {PKG} ({ARCH}) ===", flush=True)
           print(f"API: {API}", flush=True)
+
+          # Method 0: Direct JSON download info (most reliable)
+          print("\nMethod 0: Direct download info via JSON API...", flush=True)
+          info = fetch_json(f"{API}/api/download-info/{PKG}?arch={ARCH}")
+          if info and info.get('success') and info.get('downloadUrl'):
+              if process_download_info(info):
+                  sys.exit(0)
+              else:
+                  print("  Method 0 download failed, trying fallbacks...", flush=True)
+          else:
+              err = info.get('error') if info else 'no response'
+              print(f"  Method 0 failed: {err}", flush=True)
+
+          os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
 
           # Method 1: Merged download (server-side merge+sign)
           print("\nMethod 1: Merged download via SSE stream...", flush=True)
@@ -164,57 +238,19 @@ jobs:
 
           os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
 
-          # Method 2: Direct CDN download via info stream
+          # Method 2: Direct CDN download via info stream (SSE fallback)
           print("\nMethod 2: Direct CDN download via info stream...", flush=True)
           info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=120)
 
           if not info:
-              print("::error::Failed to get download info from API")
+              print("::error::Failed to get download info from API (all methods exhausted)")
               sys.exit(1)
 
-          dl_url = info.get('downloadUrl')
-          cookies_list = info.get('cookies', [])
-          cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies_list]) if cookies_list else ''
-          splits = info.get('splits', [])
-
-          print(f"  App: {info.get('title', PKG)}", flush=True)
-          print(f"  Version: {info.get('version')} (code: {info.get('versionCode')})", flush=True)
-          print(f"  Base: {info.get('filename')} ({info.get('size')})", flush=True)
-          print(f"  Cookie: {cookie_str}", flush=True)
-          print(f"  Splits available: {len(splits)}", flush=True)
-          for sp in splits:
-              print(f"    - {sp.get('name')}: {sp.get('size', 0) // 1024 // 1024} MB", flush=True)
-
-          if not dl_url:
-              print("::error::No download URL in info response")
+          if process_download_info(info):
+              sys.exit(0)
+          else:
+              print("::error::Download failed after getting info")
               sys.exit(1)
-
-          print(f"\n  Downloading base APK from Google CDN...", flush=True)
-          if not download_file(dl_url, 'jiohotstar.apk', cookie_str, 300):
-              print("::error::Base APK download failed")
-              sys.exit(1)
-
-          if os.path.getsize('jiohotstar.apk') < 1000000:
-              sz = os.path.getsize('jiohotstar.apk')
-              print(f"::error::Base APK too small ({sz} bytes)")
-              sys.exit(1)
-
-          print(f"  SUCCESS: Base APK {fmt_size('jiohotstar.apk')}", flush=True)
-
-          for split in splits:
-              if 'arm64' in split.get('name', '').lower():
-                  split_url = split.get('downloadUrl')
-                  if split_url:
-                      print(f"\n  Pre-downloading arm64 split ({split.get('name')}) for native lib injection...", flush=True)
-                      if download_file(split_url, 'arm64_split.apk', cookie_str, 300):
-                          print(f"  Arm64 split saved: {fmt_size('arm64_split.apk')}", flush=True)
-                      else:
-                          print(f"  WARNING: Arm64 split download failed, will retry during injection", flush=True)
-                  break
-
-          print(f"\n=== Download complete: {fmt_size('jiohotstar.apk')} ===", flush=True)
-          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
-              f.write(f"downloaded_size={fmt_size('jiohotstar.apk')}\n")
 
           PYEOF
 
@@ -473,12 +509,16 @@ jobs:
 
           if [ -z "$LIB_SOURCE" ]; then
             echo "Downloading arm64 split info from API..."
-            ARM64_INFO=$(curl -sN --max-time 120 "${API}/api/download-info-stream/${PKG}?arch=${ARCH}" 2>/dev/null | while IFS= read -r line; do
-              if echo "$line" | grep -q '"type":"success"'; then
-                echo "$line" | sed 's/^data: //'
-                break
-              fi
-            done)
+            ARM64_INFO=$(curl -sS --max-time 60 "${API}/api/download-info/${PKG}?arch=${ARCH}" 2>/dev/null)
+            if [ -z "$ARM64_INFO" ] || ! echo "$ARM64_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('success') and d.get('downloadUrl') else 1)" 2>/dev/null; then
+              # SSE fallback if JSON endpoint fails
+              ARM64_INFO=$(curl -sN --max-time 120 "${API}/api/download-info-stream/${PKG}?arch=${ARCH}" 2>/dev/null | while IFS= read -r line; do
+                if echo "$line" | grep -q '"type":"success"'; then
+                  echo "$line" | sed 's/^data: //'
+                  break
+                fi
+              done)
+            fi
 
             if [ -n "$ARM64_INFO" ]; then
               ARM64_URL=$(echo "$ARM64_INFO" | python3 -c "
