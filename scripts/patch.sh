@@ -389,27 +389,92 @@ patch_app_class() {
 }
 
 patch_identity_repo() {
-    log_i "Patching IdentityRepository (LDf/d)..."
+    log_i "Patching IdentityRepository (LFf/d)..."
     local id_file=""
     for smali_dir in "${DECOMPILED_DIR}"/smali*/; do
-        if [ -f "${smali_dir}Df/d.smali" ]; then
-            id_file="${smali_dir}Df/d.smali"
+        if [ -f "${smali_dir}Ff/d.smali" ]; then
+            id_file="${smali_dir}Ff/d.smali"
             break
         fi
     done
-    [ -z "$id_file" ] && { log_w "  IdentityRepository (Df/d.smali) NOT FOUND - skipping"; return; }
+    [ -z "$id_file" ] && { log_w "  IdentityRepository (Ff/d.smali) NOT FOUND - skipping"; return; }
     log_i "  Found: $id_file"
 
     grep -q "CookieSeeder" "$id_file" 2>/dev/null && { log_w "  Already patched, skipping"; return; }
 
     local tmp="${WORK_DIR}/patched_id.smali"
     awk '
-    BEGIN { in_i = 0; in_d = 0; in_ann = 0; first_inst = 0; }
+    BEGIN { in_c = 0; in_i = 0; in_ann = 0; first_inst = 0; }
 
-    /\.method public final i\(Lot\/d;\)Ljava\/lang\/Object;/ {
-        in_i = 1; in_d = 0; in_ann = 0; first_inst = 0
+    /\.method public final c\(Ltt\/d;\)Ljava\/lang\/Object;/ {
+        in_c = 1; in_i = 0; in_ann = 0; first_inst = 0
         print; next
     }
+    in_c == 1 {
+        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+        if (/\.annotation build/) { in_ann = 1 }
+        if (/\.end annotation/) { in_ann = 0 }
+        if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
+        if (/iget-object v0, p0, LFf\/d;->a:Ljava\/lang\/String;/ && first_inst == 0) {
+            first_inst = 1
+            print ""
+            print "    # === PATCH: Inject user token when field a is null ==="
+            print "    iget-object v0, p0, LFf/d;->a:Ljava/lang/String;"
+            print "    if-nez v0, :patch_orig_c"
+            print ""
+            print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
+            print "    move-result-object v1"
+            print "    if-nez v1, :patch_orig_c"
+            print ""
+            print "    iput-object v1, p0, LFf/d;->a:Ljava/lang/String;"
+            print "    return-object v1"
+            print ""
+            print "    :patch_orig_c"
+            print ""
+        }
+        if (/^\.end method/) { in_c = 0 }
+        print; next
+    }
+
+    /\.method public final i\(Lye\/J;\)Ljava\/lang\/Object;/ {
+        in_i = 1; in_c = 0; in_ann = 0; first_inst = 0
+        print; next
+    }
+    in_i == 1 {
+        if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+        if (/\.annotation build/) { in_ann = 1 }
+        if (/\.end annotation/) { in_ann = 0 }
+        if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
+        if (/iget-object v0, p0, LFf\/d;->g:Ljava\/lang\/String;/ && first_inst == 0) {
+            first_inst = 1
+            print ""
+            print "    # === PATCH: Inject media token when field g is null ==="
+            print "    iget-object v0, p0, LFf/d;->g:Ljava/lang/String;"
+            print "    if-nez v0, :patch_orig_i"
+            print ""
+            print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
+            print "    move-result-object v1"
+            print "    if-nez v1, :patch_orig_i"
+            print ""
+            print "    iput-object v1, p0, LFf/d;->g:Ljava/lang/String;"
+            print "    return-object v1"
+            print ""
+            print "    :patch_orig_i"
+            print ""
+        }
+        if (/^\.end method/) { in_i = 0 }
+        print; next
+    }
+
+    { print }
+    ' "$id_file" > "$tmp"
+
+    [ ! -s "$tmp" ] && { log_e "  AWK produced empty output"; exit 1; }
+    mv "$tmp" "$id_file"
+
+    grep -q "getInjectedUserToken" "$id_file" && log_ok "  getUserToken patch: OK" || { log_e "  getUserToken patch FAILED"; exit 1; }
+    grep -q "getInjectedMediaToken" "$id_file" && log_ok "  getMediaToken patch: OK" || { log_e "  getMediaToken patch FAILED"; exit 1; }
+}
     in_i == 1 {
         if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
         if (/\.annotation build/) { in_ann = 1 }

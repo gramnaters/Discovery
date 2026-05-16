@@ -348,15 +348,14 @@ jobs:
         run: |
           ID_REPO=""
           for dir in decompiled/smali*/; do
-            if [ -f "${dir}Df/d.smali" ]; then
-              ID_REPO="${dir}Df/d.smali"
+            if [ -f "${dir}Ff/d.smali" ]; then
+              ID_REPO="${dir}Ff/d.smali"
               break
             fi
           done
 
           if [ -z "$ID_REPO" ]; then
-            echo "::warning::IdentityRepository (Df/d.smali) not found in this version - skipping"
-            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "::warning::IdentityRepository (Ff/d.smali) not found in this version - skipping"
             exit 0
           fi
           echo "Found: $ID_REPO"
@@ -367,10 +366,40 @@ jobs:
           fi
 
           awk '
-          BEGIN { in_i = 0; in_d = 0; in_ann = 0; first_inst = 0; }
+          BEGIN { in_c = 0; in_i = 0; in_ann = 0; first_inst = 0; }
 
-          /\.method public final i\(Lot\/d;\)Ljava\/lang\/Object;/ {
-            in_i = 1; in_d = 0; in_ann = 0; first_inst = 0
+          /\.method public final c\(Ltt\/d;\)Ljava\/lang\/Object;/ {
+            in_c = 1; in_i = 0; in_ann = 0; first_inst = 0
+            print; next
+          }
+          in_c == 1 {
+            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
+            if (/\.annotation build/) { in_ann = 1 }
+            if (/\.end annotation/) { in_ann = 0 }
+            if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
+            if (/iget-object v0, p0, LFf\/d;->a:Ljava\/lang\/String;/ && first_inst == 0) {
+              first_inst = 1
+              print ""
+              print "    # PATCH: inject user token when field a is null"
+              print "    iget-object v0, p0, LFf/d;->a:Ljava/lang/String;"
+              print "    if-nez v0, :patch_orig_c"
+              print ""
+              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
+              print "    move-result-object v1"
+              print "    if-nez v1, :patch_orig_c"
+              print ""
+              print "    iput-object v1, p0, LFf/d;->a:Ljava/lang/String;"
+              print "    return-object v1"
+              print ""
+              print "    :patch_orig_c"
+              print ""
+            }
+            if (/^\.end method/) { in_c = 0 }
+            print; next
+          }
+
+          /\.method public final i\(Lye\/J;\)Ljava\/lang\/Object;/ {
+            in_i = 1; in_c = 0; in_ann = 0; first_inst = 0
             print; next
           }
           in_i == 1 {
@@ -378,54 +407,24 @@ jobs:
             if (/\.annotation build/) { in_ann = 1 }
             if (/\.end annotation/) { in_ann = 0 }
             if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
-            if (/iget-object v0, p0, LDf\/d;->a:Ljava\/lang\/String;/ && first_inst == 0) {
+            if (/iget-object v0, p0, LFf\/d;->g:Ljava\/lang\/String;/ && first_inst == 0) {
               first_inst = 1
               print ""
-              print "    # PATCH: inject user token when field a is null"
-              print "    iget-object v0, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    # PATCH: inject media token when field g is null"
+              print "    iget-object v0, p0, LFf/d;->g:Ljava/lang/String;"
               print "    if-nez v0, :patch_orig_i"
               print ""
-              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedUserToken()Ljava/lang/String;"
+              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
               print "    move-result-object v1"
-              print "    if-eqz v1, :patch_orig_i"
+              print "    if-nez v1, :patch_orig_i"
               print ""
-              print "    iput-object v1, p0, LDf/d;->a:Ljava/lang/String;"
+              print "    iput-object v1, p0, LFf/d;->g:Ljava/lang/String;"
               print "    return-object v1"
               print ""
               print "    :patch_orig_i"
               print ""
             }
             if (/^\.end method/) { in_i = 0 }
-            print; next
-          }
-
-          /\.method public final d\(Lwe\/J;\)Ljava\/lang\/Object;/ {
-            in_d = 1; in_i = 0; in_ann = 0; first_inst = 0
-            print; next
-          }
-          in_d == 1 {
-            if (/\.locals 1$/) { sub(/\.locals 1$/, ".locals 2"); print; next }
-            if (/\.annotation build/) { in_ann = 1 }
-            if (/\.end annotation/) { in_ann = 0 }
-            if (/^\s*\.line [0-9]+\s*$/ && first_inst == 0 && !in_ann) { next }
-            if (/iget-object v0, p0, LDf\/d;->g:Ljava\/lang\/String;/ && first_inst == 0) {
-              first_inst = 1
-              print ""
-              print "    # PATCH: inject media token when field g is null"
-              print "    iget-object v0, p0, LDf\/d;->g:Ljava/lang/String;"
-              print "    if-nez v0, :patch_orig_d"
-              print ""
-              print "    invoke-static {}, Lcom/hotstar/patch/CookieSeeder;->getInjectedMediaToken()Ljava/lang/String;"
-              print "    move-result-object v1"
-              print "    if-eqz v1, :patch_orig_d"
-              print ""
-              print "    iput-object v1, p0, LDf/d;->g:Ljava/lang/String;"
-              print "    return-object v1"
-              print ""
-              print "    :patch_orig_d"
-              print ""
-            }
-            if (/^\.end method/) { in_d = 0 }
             print; next
           }
 
