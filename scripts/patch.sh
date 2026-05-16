@@ -433,6 +433,7 @@ patch_identity_repo() {
             print ""
             print "    :patch_orig_c"
             print ""
+            next
         }
         if (/^\.end method/) { in_c = 0 }
         print; next
@@ -465,6 +466,7 @@ patch_identity_repo() {
             print ""
             print "    :patch_orig_i"
             print ""
+            next
         }
         if (/^\.end method/) { in_i = 0 }
         print; next
