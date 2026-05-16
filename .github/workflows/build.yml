@@ -455,6 +455,7 @@ jobs:
         if: steps.native_check.outputs.lib_count == '0'
         env:
           APK_DL_API: ${{ env.APK_DL_API }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           echo "No native libs found, need arm64 split..."
           PKG="${{ env.PACKAGE_NAME }}"
@@ -542,8 +543,6 @@ jobs:
             echo "No arm64 split available, skipping native lib injection"
             cp jiohotstar_unsigned.apk jiohotstar_patched.apk
           fi
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
 
       - name: Sign APK (when libs already present)
         if: steps.native_check.outputs.lib_count != '0'
