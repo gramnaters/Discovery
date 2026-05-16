@@ -188,21 +188,8 @@ jobs:
           print(f"=== Downloading {PKG} ({ARCH}) ===", flush=True)
           print(f"API: {API}", flush=True)
 
-          # Method 1: Try download-info-stream SSE first (simpler than merged, handles auth internally)
-          print("\nMethod 1: Direct CDN download via info stream SSE...", flush=True)
-          info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=180)
-          if info and info.get('downloadUrl'):
-              if process_download_info(info):
-                  sys.exit(0)
-              else:
-                  os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
-          else:
-              print(f"  Method 1: no download URL from info stream", flush=True)
-
-          os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
-
-          # Method 2: Merged download via merged-stream SSE (fallback, may time out for large apps)
-          print("\nMethod 2: Merged download via SSE stream...", flush=True)
+          # Method 1: Merged download via merged-stream SSE (includes all config splits, no resource loss)
+          print("\nMethod 1: Merged download via SSE stream...", flush=True)
           merged = parse_sse(f"{API}/api/download-merged-stream/{PKG}?arch={ARCH}", max_wait=300)
 
           if merged and merged.get('download_id'):
@@ -221,6 +208,17 @@ jobs:
                   print(f"  Failed to download merged APK from temp endpoint", flush=True)
           else:
               print(f"  Merged download did not return download_id (may have timed out for large app)", flush=True)
+
+          os.remove('jiohotstar.apk') if os.path.exists('jiohotstar.apk') else None
+
+          # Method 2: Direct CDN download via info stream SSE (fallback, base-only — may miss split resources)
+          print("\nMethod 2: Direct CDN download via info stream SSE (fallback)...", flush=True)
+          info = parse_sse(f"{API}/api/download-info-stream/{PKG}?arch={ARCH}", max_wait=180)
+          if info and info.get('downloadUrl'):
+              if process_download_info(info):
+                  sys.exit(0)
+          else:
+              print(f"  Method 2: no download URL from info stream", flush=True)
 
           print("::error::All download methods exhausted")
           sys.exit(1)
